@@ -7,6 +7,14 @@ set -eu
 
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo sh install.sh)"; exit 1; }
 : "${OBSERVANT_URL:?set OBSERVANT_URL}"
+
+# The agent posts to the write endpoint itself, so accept either form:
+# a base URL (https://host) or the full endpoint (https://host/write).
+case "$OBSERVANT_URL" in
+    */write) : ;;
+    */) OBSERVANT_URL="${OBSERVANT_URL}write" ;;
+    *) OBSERVANT_URL="${OBSERVANT_URL}/write" ;;
+esac
 : "${OBSERVANT_TOKEN:?set OBSERVANT_TOKEN}"
 BIN="${1:-./observant-agent}"
 [ -f "$BIN" ] || { echo "binary not found: $BIN"; exit 1; }
