@@ -13,20 +13,10 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 15
     steps:
-      - name: Check the toolchain
-        run: |
-          set -eu
-          for t in git go; do
-            command -v "$t" >/dev/null || { echo "this runner has no $t on PATH" >&2; exit 1; }
-          done
-      - name: Check out the commit
-        run: |
-          set -eu
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* 2>/dev/null || true
-          git init -q .
-          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git fetch -q --depth 1 origin "${{ github.sha }}"
-          git checkout -q FETCH_HEAD
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - run: go vet ./...
       - run: go test -count=1 ./...
       - run: CGO_ENABLED=0 go build ./...
