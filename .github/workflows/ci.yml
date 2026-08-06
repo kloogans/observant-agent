@@ -6,7 +6,12 @@ on:
 
 jobs:
   agent:
-    runs-on: ubuntu-latest
+    # Our own runner. GitHub's hosted runners are metered on a private repo and
+    # queue one job at a time; this repo is public, but one runner pool keeps
+    # both repos on the same, predictable path. The timeout makes a wedged job
+    # fail loudly instead of hanging.
+    runs-on: self-hosted
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
