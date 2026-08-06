@@ -5,12 +5,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jamesobrien/observant/agent/internal/docker"
 )
 
 func parse(t *testing.T, envs map[string]string, args ...string) (*Config, error) {
 	t.Helper()
 	for _, k := range []string{"OBSERVANT_URL", "OBSERVANT_TOKEN", "OBSERVANT_INTERVAL",
-		"OBSERVANT_HOSTNAME", "OBSERVANT_ROLE", "OBSERVANT_DOCKER", "OBSERVANT_SOCKET"} {
+		"OBSERVANT_HOSTNAME", "OBSERVANT_ROLE", "OBSERVANT_DOCKER", "OBSERVANT_SOCKET",
+		"OBSERVANT_INSPECT_EVERY"} {
 		t.Setenv(k, "")
 	}
 	for k, v := range envs {
@@ -141,6 +144,36 @@ func TestDockerModeAliases(t *testing.T) {
 	}
 	if _, err := parse(t, nil, "-docker", "maybe"); err == nil {
 		t.Error("expected an error for an unknown docker mode")
+	}
+}
+
+func TestInspectEvery(t *testing.T) {
+	c, err := parse(t, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.InspectEvery != docker.DefaultInspectEvery {
+		t.Errorf("default = %d want %d", c.InspectEvery, docker.DefaultInspectEvery)
+	}
+	c, err = parse(t, map[string]string{"OBSERVANT_INSPECT_EVERY": "4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.InspectEvery != 4 {
+		t.Errorf("env = %d want 4", c.InspectEvery)
+	}
+	c, err = parse(t, map[string]string{"OBSERVANT_INSPECT_EVERY": "4"}, "-inspect-every", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.InspectEvery != 2 {
+		t.Errorf("flag = %d want 2", c.InspectEvery)
+	}
+	if _, err := parse(t, map[string]string{"OBSERVANT_INSPECT_EVERY": "often"}); err == nil {
+		t.Error("expected an error for a value that is not an integer")
+	}
+	if _, err := parse(t, nil, "-inspect-every", "0"); err == nil {
+		t.Error("expected an error for a value below 1")
 	}
 }
 

@@ -3,16 +3,22 @@
 // One Collector keeps the state that the delta math needs. Call Collect once
 // per interval from one goroutine. The Collector is not safe for concurrent
 // use.
+//
+// Every gopsutil call runs in its own goroutine under a deadline. gopsutil
+// ignores the context on Linux, so a blocked syscall on a dead network mount
+// would otherwise stop the whole agent.
 package collect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -131,26 +137,71 @@ type Snapshot struct {
 	Errs   []error
 }
 
+// ErrTimeout reports that a collector did not answer before its deadline.
+var ErrTimeout = errors.New("timed out")
+
+const (
+	// collectorTimeout bounds one collector call.
+	collectorTimeout = 5 * time.Second
+	// mountTimeout bounds one filesystem usage call. A dead network mount
+	// blocks the statfs syscall, so every mount gets its own deadline.
+	mountTimeout = 2 * time.Second
+	// maxMountTimeouts is the number of timeouts after which the collector
+	// stops reading a mount. Every read of a dead mount costs one goroutine
+	// that never returns, so the collector must stop trying.
+	maxMountTimeouts = 3
+	// timeoutLogEvery is the quiet period after a timeout report. A stuck
+	// collector times out on every cycle, and one report per cycle floods
+	// the log.
+	timeoutLogEvery = 10 * time.Minute
+)
+
+// diskPartitions and diskUsage are the gopsutil disk calls. A test replaces
+// them to simulate a mount that never answers.
+var (
+	diskPartitions = disk.PartitionsWithContext
+	diskUsage      = disk.UsageWithContext
+)
+
 // Collector reads the host metrics and keeps the delta state.
 type Collector struct {
-	prevCPU  cpu.TimesStat
-	haveCPU  bool
-	cores    int
-	timeout  time.Duration
-	mountErr map[string]bool
+	prevCPU cpu.TimesStat
+	haveCPU bool
+	cores   int
+	// timeout bounds one collector call. mountTime bounds one mount read.
+	timeout   time.Duration
+	mountTime time.Duration
+	mountErr  map[string]bool
+	// mountTimeouts counts the timeouts of one mount in a row.
+	mountTimeouts map[string]int
+	// timeoutAt is the time of the last timeout report of one collector.
+	timeoutAt map[string]time.Time
+
+	// mu guards inflight only. A call that passed its deadline keeps running
+	// in its own goroutine and clears its flag when the syscall returns.
+	mu       sync.Mutex
+	inflight map[string]bool
 }
 
 // New makes a Collector. The timeout bounds one collector call.
 func New() *Collector {
-	return &Collector{timeout: 5 * time.Second, mountErr: map[string]bool{}}
+	return &Collector{
+		timeout:       collectorTimeout,
+		mountTime:     mountTimeout,
+		mountErr:      map[string]bool{},
+		mountTimeouts: map[string]int{},
+		timeoutAt:     map[string]time.Time{},
+		inflight:      map[string]bool{},
+	}
 }
 
 // Prime takes the first CPU sample so that the next Collect call reports the
 // usage over the gap and not the usage since boot.
 func (c *Collector) Prime(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	if times, err := cpu.TimesWithContext(ctx, false); err == nil && len(times) > 0 {
+	times, err := deadline(ctx, c, "cpu", c.timeout, func(ctx context.Context) ([]cpu.TimesStat, error) {
+		return cpu.TimesWithContext(ctx, false)
+	})
+	if err == nil && len(times) > 0 {
 		c.prevCPU = times[0]
 		c.haveCPU = true
 	}
@@ -158,55 +209,141 @@ func (c *Collector) Prime(ctx context.Context) {
 
 // Collect reads every host metric once.
 // Collect returns a Snapshot even when some collectors fail.
+// A collector that passes its deadline is skipped for this cycle.
 func (c *Collector) Collect(ctx context.Context) *Snapshot {
 	s := &Snapshot{Time: time.Now()}
 
-	if v, err := c.collectCPU(ctx); err != nil {
-		s.Errs = append(s.Errs, fmt.Errorf("cpu: %w", err))
-	} else {
-		s.CPU = v
+	cpuv, err := c.collectCPU(ctx)
+	c.note(s, "cpu", err)
+	s.CPU = cpuv
+
+	loadv, err := c.collectLoad(ctx)
+	c.note(s, "load", err)
+	s.Load = loadv
+
+	memv, err := c.collectMem(ctx)
+	c.note(s, "mem", err)
+	s.Mem = memv
+
+	disks, failed, stuck, err := c.collectDisks(ctx)
+	c.note(s, "disk", err)
+	s.Disks = disks
+	if len(failed) > 0 {
+		s.Errs = append(s.Errs, fmt.Errorf("disk: cannot read mounts: %s", strings.Join(failed, ", ")))
 	}
-	if v, err := c.collectLoad(ctx); err != nil {
-		s.Errs = append(s.Errs, fmt.Errorf("load: %w", err))
-	} else {
-		s.Load = v
+	if len(stuck) > 0 {
+		s.Errs = append(s.Errs, fmt.Errorf("disk: no answer from %s after %d tries: the agent stops reading %s",
+			strings.Join(stuck, ", "), maxMountTimeouts, plural(len(stuck), "this mount", "these mounts")))
 	}
-	if v, err := c.collectMem(ctx); err != nil {
-		s.Errs = append(s.Errs, fmt.Errorf("mem: %w", err))
-	} else {
-		s.Mem = v
-	}
-	if v, failed, err := c.collectDisks(ctx); err != nil {
-		s.Errs = append(s.Errs, fmt.Errorf("disk: %w", err))
-	} else {
-		s.Disks = v
-		if len(failed) > 0 {
-			s.Errs = append(s.Errs, fmt.Errorf("disk: cannot read mounts: %s", strings.Join(failed, ", ")))
-		}
-	}
-	if v, err := c.collectDiskIO(ctx); err != nil {
-		s.Errs = append(s.Errs, fmt.Errorf("diskio: %w", err))
-	} else {
-		s.DiskIO = v
-	}
-	if v, err := c.collectNet(ctx); err != nil {
-		s.Errs = append(s.Errs, fmt.Errorf("net: %w", err))
-	} else {
-		s.Nets = v
-	}
-	if v, err := c.collectHost(ctx); err != nil {
-		s.Errs = append(s.Errs, fmt.Errorf("host: %w", err))
-	} else {
-		s.Host = v
-	}
+
+	io, err := c.collectDiskIO(ctx)
+	c.note(s, "diskio", err)
+	s.DiskIO = io
+
+	nets, err := c.collectNet(ctx)
+	c.note(s, "net", err)
+	s.Nets = nets
+
+	hostv, err := c.collectHost(ctx)
+	c.note(s, "host", err)
+	s.Host = hostv
+
 	return s
 }
 
-func (c *Collector) collectCPU(ctx context.Context) (*CPU, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
+// note records a collector error in the snapshot.
+// note reports the same timeout one time per timeoutLogEvery.
+func (c *Collector) note(s *Snapshot, name string, err error) {
+	if err == nil {
+		delete(c.timeoutAt, name)
+		return
+	}
+	if !errors.Is(err, ErrTimeout) {
+		s.Errs = append(s.Errs, fmt.Errorf("%s: %w", name, err))
+		return
+	}
+	if last, ok := c.timeoutAt[name]; ok && s.Time.Sub(last) < timeoutLogEvery {
+		return
+	}
+	c.timeoutAt[name] = s.Time
+	s.Errs = append(s.Errs, fmt.Errorf("%s: %w (further reports are suppressed for %s)", name, err, timeoutLogEvery))
+}
 
-	times, err := cpu.TimesWithContext(ctx, false)
+// deadline runs fn in its own goroutine and returns ErrTimeout when fn does
+// not answer within d.
+//
+// gopsutil ignores the context on Linux, so a blocked syscall cannot be
+// cancelled. deadline leaves the goroutine to finish on its own. A second
+// call does not start while the first one still runs, so one stuck syscall
+// costs one goroutine and not one goroutine per cycle.
+func deadline[T any](ctx context.Context, c *Collector, name string, d time.Duration, fn func(context.Context) (T, error)) (T, error) {
+	var zero T
+	if !c.begin(name) {
+		return zero, fmt.Errorf("%w: the call of the previous cycle still runs", ErrTimeout)
+	}
+	cctx, cancel := context.WithTimeout(ctx, d)
+	type result struct {
+		v   T
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		// The goroutine owns the cancel and the flag. A timeout returns to
+		// the caller first, and the goroutine cleans up when fn returns.
+		// The flag clears before the send, so a caller that receives the
+		// value can start the next call at once.
+		defer cancel()
+		v, err := fn(cctx)
+		c.end(name)
+		ch <- result{v, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-cctx.Done():
+		select {
+		case r := <-ch:
+			// fn answered at the same moment as the deadline. Take the value.
+			return r.v, r.err
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			// The agent is stopping. This is not a collector fault.
+			return zero, err
+		}
+		return zero, fmt.Errorf("%w after %s", ErrTimeout, d)
+	}
+}
+
+// begin marks a call as running. begin returns false when the call of an
+// earlier cycle has not returned yet.
+func (c *Collector) begin(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.inflight[name] {
+		return false
+	}
+	c.inflight[name] = true
+	return true
+}
+
+func (c *Collector) end(name string) {
+	c.mu.Lock()
+	delete(c.inflight, name)
+	c.mu.Unlock()
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+func (c *Collector) collectCPU(ctx context.Context) (*CPU, error) {
+	times, err := deadline(ctx, c, "cpu", c.timeout, func(ctx context.Context) ([]cpu.TimesStat, error) {
+		return cpu.TimesWithContext(ctx, false)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +353,10 @@ func (c *Collector) collectCPU(ctx context.Context) (*CPU, error) {
 	now := times[0]
 
 	if c.cores == 0 {
-		if n, err := cpu.CountsWithContext(ctx, true); err == nil && n > 0 {
+		n, err := deadline(ctx, c, "cpu.counts", c.timeout, func(ctx context.Context) (int, error) {
+			return cpu.CountsWithContext(ctx, true)
+		})
+		if err == nil && n > 0 {
 			c.cores = n
 		}
 	}
@@ -264,9 +404,7 @@ func clampPercent(v float64) float64 {
 }
 
 func (c *Collector) collectLoad(ctx context.Context) (*Load, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	a, err := load.AvgWithContext(ctx)
+	a, err := deadline(ctx, c, "load", c.timeout, load.AvgWithContext)
 	if err != nil {
 		return nil, err
 	}
@@ -274,9 +412,7 @@ func (c *Collector) collectLoad(ctx context.Context) (*Load, error) {
 }
 
 func (c *Collector) collectMem(ctx context.Context) (*Mem, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	v, err := mem.VirtualMemoryWithContext(ctx)
+	v, err := deadline(ctx, c, "mem", c.timeout, mem.VirtualMemoryWithContext)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +425,7 @@ func (c *Collector) collectMem(ctx context.Context) (*Mem, error) {
 		Buffers:     v.Buffers,
 		UsedPercent: round2(v.UsedPercent),
 	}
-	if s, err := mem.SwapMemoryWithContext(ctx); err == nil {
+	if s, err := deadline(ctx, c, "mem.swap", c.timeout, mem.SwapMemoryWithContext); err == nil {
 		out.SwapTotal = s.Total
 		out.SwapUsed = s.Used
 		out.SwapFree = s.Free
@@ -298,17 +434,17 @@ func (c *Collector) collectMem(ctx context.Context) (*Mem, error) {
 	return out, nil
 }
 
-// collectDisks returns the usable mounts and the mounts it could not read.
+// collectDisks returns the usable mounts, the mounts it could not read, and
+// the mounts that it stops reading from now on.
 // It reports each unreadable mount one time only.
-func (c *Collector) collectDisks(ctx context.Context) ([]Disk, []string, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-
-	parts, err := disk.PartitionsWithContext(ctx, false)
+func (c *Collector) collectDisks(ctx context.Context) ([]Disk, []string, []string, error) {
+	parts, err := deadline(ctx, c, "disk.partitions", c.timeout, func(ctx context.Context) ([]disk.PartitionStat, error) {
+		return diskPartitions(ctx, false)
+	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	var failed []string
+	var failed, stuck []string
 	out := make([]Disk, 0, len(parts))
 	seen := make(map[string]bool, len(parts))
 	// live holds the mounts of this cycle. A mount that disappears must lose
@@ -320,16 +456,32 @@ func (c *Collector) collectDisks(ctx context.Context) ([]Disk, []string, error) 
 			continue
 		}
 		live[p.Mountpoint] = true
-		u, err := disk.UsageWithContext(ctx, p.Mountpoint)
-		if err != nil {
-			// A permission error on one mount must not kill the cycle.
-			// Report the mount one time, then stay quiet about it.
-			if !c.mountErr[p.Mountpoint] {
-				c.mountErr[p.Mountpoint] = true
-				failed = append(failed, p.Mountpoint)
+		if c.mountTimeouts[p.Mountpoint] >= maxMountTimeouts {
+			// A dead network mount blocks the statfs syscall for ever. Every
+			// further read costs one goroutine that never returns.
+			continue
+		}
+		mount := p.Mountpoint
+		u, err := deadline(ctx, c, "disk:"+mount, c.mountTime, func(ctx context.Context) (*disk.UsageStat, error) {
+			return diskUsage(ctx, mount)
+		})
+		if errors.Is(err, ErrTimeout) {
+			c.mountTimeouts[mount]++
+			if c.mountTimeouts[mount] == maxMountTimeouts {
+				stuck = append(stuck, mount)
 			}
 			continue
 		}
+		if err != nil {
+			// A permission error on one mount must not kill the cycle.
+			// Report the mount one time, then stay quiet about it.
+			if !c.mountErr[mount] {
+				c.mountErr[mount] = true
+				failed = append(failed, mount)
+			}
+			continue
+		}
+		delete(c.mountTimeouts, mount)
 		if u.Total == 0 {
 			continue
 		}
@@ -358,15 +510,21 @@ func (c *Collector) collectDisks(ctx context.Context) ([]Disk, []string, error) 
 			delete(c.mountErr, m)
 		}
 	}
+	// A mount that disappears loses its timeout count, so the collector reads
+	// it again if it comes back.
+	for m := range c.mountTimeouts {
+		if !live[m] {
+			delete(c.mountTimeouts, m)
+		}
+	}
 	sortByName(out, func(d Disk) string { return d.Mount })
-	return out, failed, nil
+	return out, failed, stuck, nil
 }
 
 func (c *Collector) collectDiskIO(ctx context.Context) ([]DiskIO, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-
-	counters, err := disk.IOCountersWithContext(ctx)
+	counters, err := deadline(ctx, c, "diskio", c.timeout, func(ctx context.Context) (map[string]disk.IOCountersStat, error) {
+		return disk.IOCountersWithContext(ctx)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -395,10 +553,9 @@ func (c *Collector) collectDiskIO(ctx context.Context) ([]DiskIO, error) {
 }
 
 func (c *Collector) collectNet(ctx context.Context) ([]Net, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-
-	counters, err := net.IOCountersWithContext(ctx, true)
+	counters, err := deadline(ctx, c, "net", c.timeout, func(ctx context.Context) ([]net.IOCountersStat, error) {
+		return net.IOCountersWithContext(ctx, true)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -427,9 +584,7 @@ func (c *Collector) collectNet(ctx context.Context) ([]Net, error) {
 }
 
 func (c *Collector) collectHost(ctx context.Context) (*Host, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	i, err := host.InfoWithContext(ctx)
+	i, err := deadline(ctx, c, "host", c.timeout, host.InfoWithContext)
 	if err != nil {
 		return nil, err
 	}
@@ -622,8 +777,30 @@ func SkipBlockDevice(name string) bool {
 	return false
 }
 
-// skipIfacePrefixes lists the interfaces that add churn without value.
+// skipIfacePrefixes lists the interfaces that add churn without value. The
+// name must be the prefix alone or the prefix and a number, so a real
+// interface with the same start keeps its series.
 var skipIfacePrefixes = []string{"lo", "gif", "stf", "anpi", "awdl", "llw", "utun", "ap"}
+
+// skipIfaceAnyPrefixes lists the container and virtual machine interfaces.
+// The name carries a random suffix, so the whole prefix family goes.
+//
+// A fleet chart sums one series per interface. A host that runs 30 containers
+// holds 30 veth interfaces that mirror the traffic of the real interface, so
+// the chart counts the same bytes several times and the real interface
+// disappears in the noise.
+var skipIfaceAnyPrefixes = []string{
+	"veth",    // one per container on a docker or podman bridge
+	"docker",  // docker0 and docker_gwbridge
+	"br-",     // a docker user-defined bridge, br-<hex>
+	"podman",  // podman0 and the podman bridges
+	"cni",     // cni0 and cni-podman0
+	"virbr",   // libvirt bridges
+	"flannel", // kubernetes overlay
+	"cali",    // calico container interfaces
+	"tap",     // a virtual machine tap device
+	"dummy",   // the kernel dummy device
+}
 
 // SkipInterface reports whether the interface is not worth a series.
 func SkipInterface(name string) bool {
@@ -635,7 +812,12 @@ func SkipInterface(name string) bool {
 			return true
 		}
 	}
-	return strings.HasPrefix(name, "veth")
+	for _, p := range skipIfaceAnyPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func isDigits(s string) bool {

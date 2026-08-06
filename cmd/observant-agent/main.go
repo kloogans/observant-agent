@@ -123,6 +123,7 @@ func (a *agent) startDocker(ctx context.Context) {
 		a.dockerErr = err
 		return
 	}
+	c.SetInspectEvery(a.cfg.InspectEvery)
 	a.docker = c
 }
 
@@ -140,6 +141,7 @@ func (a *agent) redetectDocker(ctx context.Context) {
 		a.dockerErr = err
 		return
 	}
+	c.SetInspectEvery(a.cfg.InspectEvery)
 	a.docker = c
 	a.dockerErr = nil
 	a.dockerLastMsg = ""
@@ -412,8 +414,12 @@ func (a *agent) selfCheck(ctx context.Context) error {
 					s.Name, s.RestartCount, s.Image)
 				continue
 			}
-			fmt.Fprintf(out, "           %-24s cpu %.2f%%, mem %s, image %s\n",
-				s.Name, s.CPUPercent, human(s.MemUsed), s.Image)
+			restarts := ""
+			if s.HasRestartCount {
+				restarts = fmt.Sprintf("%d restarts, ", s.RestartCount)
+			}
+			fmt.Fprintf(out, "           %-24s cpu %.2f%%, mem %s, %simage %s\n",
+				s.Name, s.CPUPercent, human(s.MemUsed), restarts, s.Image)
 		}
 	}
 

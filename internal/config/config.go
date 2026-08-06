@@ -11,8 +11,11 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jamesobrien/observant/agent/internal/docker"
 )
 
 // DockerMode selects the container collector behaviour.
@@ -36,6 +39,9 @@ type Config struct {
 	Role     string
 	Docker   DockerMode
 	Socket   string
+	// InspectEvery is the number of cycles between two inspect calls of the
+	// same running container. The inspect call reads the restart count.
+	InspectEvery int
 
 	Version   bool
 	Once      bool
@@ -53,7 +59,7 @@ func Parse(name string, args []string, out io.Writer) (*Config, error) {
 	fs.SetOutput(out)
 
 	var interval string
-	var docker string
+	var dockerMode string
 
 	fs.StringVar(&c.URL, "url", env("OBSERVANT_URL", ""),
 		"ingest endpoint URL (env OBSERVANT_URL)")
@@ -65,10 +71,16 @@ func Parse(name string, args []string, out io.Writer) (*Config, error) {
 		"host tag value, defaults to the system hostname (env OBSERVANT_HOSTNAME)")
 	fs.StringVar(&c.Role, "role", env("OBSERVANT_ROLE", ""),
 		"optional role tag, for example builder (env OBSERVANT_ROLE)")
-	fs.StringVar(&docker, "docker", env("OBSERVANT_DOCKER", "auto"),
+	fs.StringVar(&dockerMode, "docker", env("OBSERVANT_DOCKER", "auto"),
 		"container collector: on, off, or auto (env OBSERVANT_DOCKER)")
 	fs.StringVar(&c.Socket, "socket", env("OBSERVANT_SOCKET", ""),
 		"container socket path, defaults to auto-detection (env OBSERVANT_SOCKET)")
+	inspectEvery, err := envInt("OBSERVANT_INSPECT_EVERY", docker.DefaultInspectEvery)
+	if err != nil {
+		return nil, err
+	}
+	fs.IntVar(&c.InspectEvery, "inspect-every", inspectEvery,
+		"cycles between two restart-count reads of the same running container (env OBSERVANT_INSPECT_EVERY)")
 
 	fs.BoolVar(&c.Version, "version", false, "print the version and exit")
 	fs.BoolVar(&c.Once, "once", false, "collect one cycle, print the line protocol, exit")
@@ -90,7 +102,11 @@ func Parse(name string, args []string, out io.Writer) (*Config, error) {
 	}
 	c.Interval = d
 
-	switch DockerMode(strings.ToLower(strings.TrimSpace(docker))) {
+	if c.InspectEvery < 1 {
+		return nil, fmt.Errorf("bad inspect-every %d: want 1 or more", c.InspectEvery)
+	}
+
+	switch DockerMode(strings.ToLower(strings.TrimSpace(dockerMode))) {
 	case DockerAuto, "":
 		c.Docker = DockerAuto
 	case DockerOn, "true", "1", "yes":
@@ -98,7 +114,7 @@ func Parse(name string, args []string, out io.Writer) (*Config, error) {
 	case DockerOff, "false", "0", "no":
 		c.Docker = DockerOff
 	default:
-		return nil, fmt.Errorf("bad docker mode %q: want on, off, or auto", docker)
+		return nil, fmt.Errorf("bad docker mode %q: want on, off, or auto", dockerMode)
 	}
 
 	// Trim first. A whitespace-only value is the same as no value.
@@ -151,4 +167,18 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt reads an integer environment variable.
+// envInt reports an error when the value is not an integer.
+func envInt(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("bad %s %q: want an integer", key, v)
+	}
+	return n, nil
 }

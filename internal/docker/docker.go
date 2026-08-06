@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"net"
@@ -35,6 +36,11 @@ const maxStoppedAge = time.Hour
 // maxStoppedInspect bounds the inspect calls of one cycle. A host with a
 // large graveyard of old containers must not slow the cycle down.
 const maxStoppedInspect = 50
+
+// DefaultInspectEvery is the number of cycles between two inspect calls of the
+// same running container. The inspect call reads the restart count, which is
+// the only way to see a container that restarts again and again.
+const DefaultInspectEvery = 10
 
 // ErrNoSocket reports that no container socket exists on this machine.
 var ErrNoSocket = errors.New("no container socket found")
@@ -71,7 +77,9 @@ type Stats struct {
 	// The encoder then drops the memory fields instead of writing a 0.
 	MemUsedOK bool
 	// RestartCount is valid only when HasRestartCount is true. The agent
-	// inspects a stopped container only, so a running container has no count.
+	// inspects a stopped container on every cycle and a running container on
+	// every inspectEvery cycle, so a running container carries the count of
+	// the last inspect call.
 	RestartCount    int64
 	HasRestartCount bool
 }
@@ -83,6 +91,17 @@ type cpuSample struct {
 	seen   time.Time
 }
 
+// restartSample is the last restart count read for a running container.
+// The client reports the cached count on every cycle, so the series holds a
+// point per cycle and a server query can measure the increase over any window.
+type restartSample struct {
+	count int64
+	// cycle is the collection cycle of the last inspect call.
+	cycle int64
+	// have is false while no inspect call ever returned a count.
+	have bool
+}
+
 // Client reads container stats from one socket.
 type Client struct {
 	http    *http.Client
@@ -91,9 +110,15 @@ type Client struct {
 	// batch limits concurrent stats calls. Docker below 25.0 serves
 	// concurrent stats calls slowly, so the client drops to one at a time.
 	batch int
+	// inspectEvery is the cycle gap between two inspect calls of the same
+	// running container.
+	inspectEvery int
 
-	mu   sync.Mutex
-	prev map[string]cpuSample
+	mu sync.Mutex
+	// cycle counts the Collect calls since start.
+	cycle   int64
+	prev    map[string]cpuSample
+	restart map[string]restartSample
 }
 
 // candidateSockets lists the sockets the agent probes, in order.
@@ -141,9 +166,11 @@ func Detect(ctx context.Context, socket string) (*Client, error) {
 func newClient(socket string) *Client {
 	d := &net.Dialer{Timeout: 2 * time.Second}
 	return &Client{
-		socket: socket,
-		batch:  5,
-		prev:   map[string]cpuSample{},
+		socket:       socket,
+		batch:        5,
+		inspectEvery: DefaultInspectEvery,
+		prev:         map[string]cpuSample{},
+		restart:      map[string]restartSample{},
 		http: &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
@@ -157,6 +184,15 @@ func newClient(socket string) *Client {
 			},
 		},
 	}
+}
+
+// SetInspectEvery sets the cycle gap between two inspect calls of the same
+// running container. A value below 1 becomes 1, which inspects every cycle.
+func (c *Client) SetInspectEvery(n int) {
+	if n < 1 {
+		n = 1
+	}
+	c.inspectEvery = n
 }
 
 // Socket returns the socket path in use.
@@ -286,6 +322,12 @@ type statsJSON struct {
 
 // Collect reads the stats of every running container and the restart count of
 // every recently stopped container.
+//
+// Collect also inspects a running container every inspectEvery cycles to read
+// its restart count. A container that restarts again and again never reaches
+// the stopped list, so the count of a running container is the only signal of
+// a restart loop.
+//
 // Collect returns the samples it managed to read and joins any errors.
 func (c *Client) Collect(ctx context.Context) ([]Stats, error) {
 	containers, err := c.Containers(ctx)
@@ -309,6 +351,7 @@ func (c *Client) Collect(ctx context.Context) ([]Stats, error) {
 	if len(stopped) > maxStoppedInspect {
 		stopped = stopped[:maxStoppedInspect]
 	}
+	cycle, inspect := c.plan(running)
 
 	out := make([]Stats, len(running)+len(stopped))
 	errs := make([]error, len(out))
@@ -326,6 +369,16 @@ func (c *Client) Collect(ctx context.Context) ([]Stats, error) {
 			if err != nil {
 				errs[i] = fmt.Errorf("%s: %w", ct.Name, err)
 				return
+			}
+			if inspect[i] {
+				n, err := c.restartCount(ctx, ct.ID)
+				// An inspect failure must not drop the stats sample. The
+				// client keeps the previous count and tries again later.
+				c.putRestart(ct.ID, n, err == nil, cycle)
+			}
+			if n, ok := c.getRestart(ct.ID); ok {
+				s.RestartCount = n
+				s.HasRestartCount = true
 			}
 			out[i] = s
 		}()
@@ -368,6 +421,77 @@ func (c *Client) Collect(ctx context.Context) ([]Stats, error) {
 
 // errSkip marks a container the collector chose not to report.
 var errSkip = errors.New("skipped")
+
+// plan starts a cycle and reports which running containers need an inspect
+// call. plan returns the cycle number and one flag per running container.
+func (c *Client) plan(running []Container) (int64, []bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cycle++
+	inspect := make([]bool, len(running))
+	for i, ct := range running {
+		inspect[i] = c.needsInspect(ct.ID, c.cycle)
+	}
+	return c.cycle, inspect
+}
+
+// needsInspect reports whether the running container needs an inspect call on
+// this cycle. The caller holds the mutex.
+func (c *Client) needsInspect(id string, cycle int64) bool {
+	r, ok := c.restart[id]
+	if !ok {
+		// A container the client never inspected. Read the count at once so
+		// that the first push of a new container carries it.
+		return true
+	}
+	every := int64(c.inspectEvery)
+	if every < 1 {
+		every = 1
+	}
+	// The slot spreads the refresh over the cycles. Every container keeps its
+	// own slot, so a 40-container host makes about 4 inspect calls per cycle
+	// instead of 40 calls on one cycle in ten.
+	return cycle-r.cycle >= every && (cycle+slot(id, every))%every == 0
+}
+
+// slot maps a container ID to a stable cycle offset in the range [0, every).
+func slot(id string, every int64) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(id))
+	return int64(h.Sum64() % uint64(every))
+}
+
+// putRestart records the result of an inspect call of a running container.
+// A failed call keeps the previous count and moves the cycle stamp only, so
+// one bad call does not blank the series.
+func (c *Client) putRestart(id string, count int64, ok bool, cycle int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r := c.restart[id]
+	r.cycle = cycle
+	if ok {
+		r.count = count
+		r.have = true
+	}
+	c.restart[id] = r
+}
+
+// getRestart returns the last known restart count of a running container.
+func (c *Client) getRestart(id string) (int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r, ok := c.restart[id]
+	return r.count, ok && r.have
+}
+
+// restartCount reads the restart count of one container.
+func (c *Client) restartCount(ctx context.Context, id string) (int64, error) {
+	var raw inspectJSON
+	if err := c.getJSON(ctx, "/containers/"+id+"/json", &raw); err != nil {
+		return 0, err
+	}
+	return raw.RestartCount, nil
+}
 
 // recentFirst orders the containers by creation time, newest first.
 func recentFirst(in []Container) []Container {
@@ -502,11 +626,12 @@ func (c *Client) stats(ctx context.Context, ct Container) (Stats, error) {
 	return s, nil
 }
 
-// pruneDead drops the CPU samples of containers that no longer run.
+// pruneDead drops the CPU samples and the restart counts of containers that
+// no longer run.
 func (c *Client) pruneDead(live []Container) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.prev) == 0 {
+	if len(c.prev) == 0 && len(c.restart) == 0 {
 		return
 	}
 	keep := make(map[string]bool, len(live))
@@ -518,6 +643,11 @@ func (c *Client) pruneDead(live []Container) {
 	for id := range c.prev {
 		if !keep[id] {
 			delete(c.prev, id)
+		}
+	}
+	for id := range c.restart {
+		if !keep[id] {
+			delete(c.restart, id)
 		}
 	}
 }

@@ -225,12 +225,20 @@ func TestPruneDeadDropsOldSamples(t *testing.T) {
 	c := newClient("/dev/null")
 	c.prev["gone"] = cpuSample{total: 1}
 	c.prev["alive"] = cpuSample{total: 2}
+	c.restart["gone"] = restartSample{count: 1, have: true}
+	c.restart["alive"] = restartSample{count: 2, have: true}
 	c.pruneDead([]Container{{ID: "alive", Running: true}, {ID: "gone", Running: false}})
 	if _, ok := c.prev["gone"]; ok {
 		t.Error("dead container sample kept")
 	}
 	if _, ok := c.prev["alive"]; !ok {
 		t.Error("live container sample dropped")
+	}
+	if _, ok := c.restart["gone"]; ok {
+		t.Error("dead container restart count kept")
+	}
+	if _, ok := c.restart["alive"]; !ok {
+		t.Error("live container restart count dropped")
 	}
 }
 
@@ -372,9 +380,10 @@ func TestStoppedContainerGetsRestartCount(t *testing.T) {
 	if !byName["web"].Running {
 		t.Error("web must be running")
 	}
-	// The inspect call costs a round trip, so a running container skips it.
-	if byName["web"].HasRestartCount {
-		t.Error("a running container must not be inspected")
+	// A container the client never saw gets one inspect call at once, so the
+	// first push already carries the restart count.
+	if !byName["web"].HasRestartCount || byName["web"].RestartCount != 4 {
+		t.Errorf("web = %+v", byName["web"])
 	}
 	if byName["job"].Running || byName["job"].RestartCount != 4 {
 		t.Errorf("job = %+v", byName["job"])
@@ -382,8 +391,92 @@ func TestStoppedContainerGetsRestartCount(t *testing.T) {
 	if statsCalls.Load() != 1 {
 		t.Errorf("stats calls = %d want 1", statsCalls.Load())
 	}
-	if inspectCalls.Load() != 1 {
-		t.Errorf("inspect calls = %d want 1", inspectCalls.Load())
+	// One inspect call for the running container and one for the stopped one.
+	if inspectCalls.Load() != 2 {
+		t.Errorf("inspect calls = %d want 2", inspectCalls.Load())
+	}
+}
+
+// A container that crashes and restarts again and again never reaches the
+// stopped list. Its restart count is the only signal of the loop.
+func TestRunningContainerCarriesTheRestartCount(t *testing.T) {
+	list := []map[string]any{
+		{"Id": "run1", "Names": []string{"/web"}, "Image": "nginx:1", "State": "running", "Created": time.Now().Unix()},
+	}
+	inspect := map[string]any{"RestartCount": 7, "State": map[string]any{"Running": true}}
+	var inspectCalls atomic.Int32
+	sock := fakeSocket(t, allHandler(t, list, inspect, nil, &inspectCalls))
+	c, err := Detect(context.Background(), sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetInspectEvery(5)
+
+	const cycles = 12
+	for i := 0; i < cycles; i++ {
+		got, err := c.Collect(context.Background())
+		if err != nil {
+			t.Fatalf("cycle %d: %v", i, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("cycle %d: samples = %d", i, len(got))
+		}
+		// Every cycle reports the count, also the cycles that make no
+		// inspect call. A sparse series would break an increase query.
+		if !got[0].HasRestartCount || got[0].RestartCount != 7 {
+			t.Fatalf("cycle %d: restart count = %+v", i, got[0])
+		}
+	}
+	// One call on the first sight, then one call per five cycles.
+	if n := inspectCalls.Load(); n < 2 || n > 4 {
+		t.Errorf("inspect calls = %d over %d cycles, want about %d", n, cycles, 1+cycles/5)
+	}
+}
+
+// The refresh of a big host must not land on one cycle.
+func TestInspectLoadIsSpreadOverCycles(t *testing.T) {
+	const containers = 40
+	var list []map[string]any
+	for i := 0; i < containers; i++ {
+		list = append(list, map[string]any{
+			"Id":    "c" + strconv.Itoa(i),
+			"Names": []string{"/app" + strconv.Itoa(i)},
+			"State": "running",
+		})
+	}
+	inspect := map[string]any{"RestartCount": 0, "State": map[string]any{"Running": true}}
+	var inspectCalls atomic.Int32
+	sock := fakeSocket(t, allHandler(t, list, inspect, nil, &inspectCalls))
+	c, err := Detect(context.Background(), sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetInspectEvery(10)
+
+	// The first cycle inspects every container one time.
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := inspectCalls.Load(); n != containers {
+		t.Fatalf("first cycle inspect calls = %d want %d", n, containers)
+	}
+	worst := int32(0)
+	for i := 0; i < 20; i++ {
+		inspectCalls.Store(0)
+		if _, err := c.Collect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if n := inspectCalls.Load(); n > worst {
+			worst = n
+		}
+	}
+	// 40 containers over 10 cycles is 4 per cycle on average. Allow slack
+	// for the hash, but a burst of 40 must not happen.
+	if worst > 12 {
+		t.Errorf("worst cycle = %d inspect calls, want a spread load", worst)
+	}
+	if worst == 0 {
+		t.Error("no refresh happened at all")
 	}
 }
 

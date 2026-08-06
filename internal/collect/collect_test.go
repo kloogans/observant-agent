@@ -2,12 +2,15 @@ package collect
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jamesobrien/observant/agent/internal/lineproto"
 	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/disk"
 )
 
 func TestSkipFstype(t *testing.T) {
@@ -56,8 +59,14 @@ func TestSkipBlockDevice(t *testing.T) {
 }
 
 func TestSkipInterface(t *testing.T) {
-	skip := []string{"lo", "lo0", "veth1a2b3c", "utun0", "awdl0", "gif0", "stf0", "ap1", ""}
-	keep := []string{"eth0", "ens3", "enp0s3", "en0", "wlan0", "docker0", "br-abc123", "tailscale0", "bond0"}
+	// A container host holds one veth per container. Those series mirror the
+	// traffic of the real interface, so a fleet chart would count it twice.
+	skip := []string{
+		"lo", "lo0", "utun0", "awdl0", "gif0", "stf0", "ap1", "",
+		"veth1a2b3c", "docker0", "docker_gwbridge", "br-9f3c1a2b4d5e",
+		"podman0", "cni-podman0", "virbr0", "flannel.1", "cali1a2b3c", "tap0", "dummy0",
+	}
+	keep := []string{"eth0", "ens3", "enp0s3", "en0", "wlan0", "tailscale0", "bond0", "br0", "wg0"}
 	for _, n := range skip {
 		if !SkipInterface(n) {
 			t.Errorf("SkipInterface(%q) = false, want true", n)
@@ -156,11 +165,138 @@ func TestMountErrEvictsGoneMounts(t *testing.T) {
 	c := New()
 	c.mountErr["/gone"] = true
 	c.mountErr["/also-gone"] = true
-	if _, _, err := c.collectDisks(context.Background()); err != nil {
+	if _, _, _, err := c.collectDisks(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(c.mountErr) != 0 {
 		t.Errorf("mountErr still holds %v", c.mountErr)
+	}
+}
+
+// A dead network mount blocks the statfs syscall. The collector must give up
+// on that mount instead of blocking the whole agent on every cycle.
+func TestStuckMountIsDroppedAfterRepeatedTimeouts(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var calls atomic.Int32
+
+	oldParts, oldUsage := diskPartitions, diskUsage
+	t.Cleanup(func() { diskPartitions, diskUsage = oldParts, oldUsage })
+	diskPartitions = func(ctx context.Context, all bool) ([]disk.PartitionStat, error) {
+		return []disk.PartitionStat{{Mountpoint: "/mnt/nfs", Device: "/dev/nfs", Fstype: "nfs4"}}, nil
+	}
+	diskUsage = func(ctx context.Context, mount string) (*disk.UsageStat, error) {
+		calls.Add(1)
+		<-release
+		return nil, nil
+	}
+
+	c := New()
+	c.mountTime = 20 * time.Millisecond
+	stuckReports := 0
+	for i := 0; i < 6; i++ {
+		out, _, stuck, err := c.collectDisks(context.Background())
+		if err != nil {
+			t.Fatalf("cycle %d: %v", i, err)
+		}
+		if len(out) != 0 {
+			t.Fatalf("cycle %d: a stuck mount must report no usage: %+v", i, out)
+		}
+		stuckReports += len(stuck)
+		// The goroutine of the timed-out call still holds the mount, so the
+		// next cycle must not start a second call.
+		time.Sleep(30 * time.Millisecond)
+	}
+	// The first call never returns, so the in-flight guard blocks the second
+	// call and the count of timeouts bans the mount. Six cycles cost one
+	// blocked goroutine.
+	if n := calls.Load(); n != 1 {
+		t.Errorf("usage calls = %d want 1", n)
+	}
+	if stuckReports != 1 {
+		t.Errorf("stuck reports = %d want 1", stuckReports)
+	}
+	if c.mountTimeouts["/mnt/nfs"] != maxMountTimeouts {
+		t.Errorf("timeout count = %d want %d", c.mountTimeouts["/mnt/nfs"], maxMountTimeouts)
+	}
+}
+
+// A timeout repeats on every cycle. The log must not repeat with it.
+func TestTimeoutReportIsRateLimited(t *testing.T) {
+	c := New()
+	now := time.Unix(1_000_000, 0)
+	first := &Snapshot{Time: now}
+	c.note(first, "disk", ErrTimeout)
+	if len(first.Errs) != 1 {
+		t.Fatalf("first report = %v want one error", first.Errs)
+	}
+	next := &Snapshot{Time: now.Add(time.Minute)}
+	c.note(next, "disk", ErrTimeout)
+	if len(next.Errs) != 0 {
+		t.Errorf("the same timeout must stay quiet: %v", next.Errs)
+	}
+	later := &Snapshot{Time: now.Add(timeoutLogEvery + time.Second)}
+	c.note(later, "disk", ErrTimeout)
+	if len(later.Errs) != 1 {
+		t.Errorf("the timeout must report again after %s: %v", timeoutLogEvery, later.Errs)
+	}
+	// A collector that recovers must report at once when it fails again.
+	c.note(&Snapshot{Time: later.Time}, "disk", nil)
+	again := &Snapshot{Time: later.Time.Add(time.Second)}
+	c.note(again, "disk", ErrTimeout)
+	if len(again.Errs) != 1 {
+		t.Errorf("a new failure after a good cycle must report: %v", again.Errs)
+	}
+	// A plain error is not a timeout and is never suppressed.
+	plainA := &Snapshot{Time: now}
+	plainB := &Snapshot{Time: now}
+	c.note(plainA, "mem", errors.New("permission denied"))
+	c.note(plainB, "mem", errors.New("permission denied"))
+	if len(plainA.Errs) != 1 || len(plainB.Errs) != 1 {
+		t.Errorf("plain errors = %v %v want one each", plainA.Errs, plainB.Errs)
+	}
+}
+
+// One stuck syscall must cost one goroutine, not one goroutine per cycle.
+func TestDeadlineStartsOneCallAtATime(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var calls atomic.Int32
+	block := func(ctx context.Context) (int, error) {
+		calls.Add(1)
+		<-release
+		return 1, nil
+	}
+
+	c := New()
+	for i := 0; i < 3; i++ {
+		v, err := deadline(context.Background(), c, "stuck", 10*time.Millisecond, block)
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("call %d: err = %v want ErrTimeout", i, err)
+		}
+		if v != 0 {
+			t.Fatalf("call %d: value = %d want the zero value", i, v)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("started calls = %d want 1", n)
+	}
+}
+
+// A collector that answers must return its value and clear the way for the
+// next cycle.
+func TestDeadlineReturnsTheValue(t *testing.T) {
+	c := New()
+	v, err := deadline(context.Background(), c, "quick", time.Second, func(ctx context.Context) (int, error) {
+		return 42, nil
+	})
+	if err != nil || v != 42 {
+		t.Fatalf("v, err = %d, %v want 42, nil", v, err)
+	}
+	if _, err := deadline(context.Background(), c, "quick", time.Second, func(ctx context.Context) (int, error) {
+		return 7, nil
+	}); err != nil {
+		t.Fatalf("second call = %v", err)
 	}
 }
 

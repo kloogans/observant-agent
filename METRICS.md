@@ -135,6 +135,12 @@ The agent skips pseudo filesystems (`tmpfs`, `devtmpfs`, `sysfs`, `proc`,
 on darwin. It also skips a mount with a total size of 0, and it keeps only the
 first mount of a repeated device and size pair.
 
+Every mount read has a 2 second deadline. A dead network mount blocks the
+statfs syscall and cannot be cancelled, so the agent reports the other mounts
+and leaves that mount out of the cycle. After 3 timeouts in a row the agent
+stops reading the mount. The mount comes back when it leaves the mount table
+and returns. The agent logs the state one time, not one time per cycle.
+
 | Tag      | Meaning                                  |
 | -------- | ---------------------------------------- |
 | `mount`  | Mountpoint path                          |
@@ -179,8 +185,15 @@ The agent skips the device prefixes `loop`, `ram`, `zram`, `fd`, `sr`, and
 One point per network interface per cycle. Every field is a counter.
 
 The agent skips loopback and the interface prefixes `lo`, `gif`, `stf`,
-`anpi`, `awdl`, `llw`, `utun`, and `ap` when a number follows the prefix. It
-skips every `veth` interface, and any interface with no traffic since boot.
+`anpi`, `awdl`, `llw`, `utun`, and `ap` when a number follows the prefix.
+
+The agent also skips every interface that starts with `veth`, `docker`, `br-`,
+`podman`, `cni`, `virbr`, `flannel`, `cali`, `tap`, or `dummy`. Those are the
+container and virtual machine interfaces. They mirror the traffic of the real
+interface, so a fleet chart would count the same bytes several times. A host
+bridge with a plain name, for example `br0` or `bond0`, keeps its series.
+
+The agent skips any interface with no traffic since boot.
 
 | Tag         | Meaning        |
 | ----------- | -------------- |
@@ -268,7 +281,7 @@ on every redeploy and grow the series count without limit.
 | `container_id`    | string  | yes     | yes     | First 12 characters of the ID |
 | `image`           | string  | yes     | yes     | Image reference            |
 | `running`         | gauge   | `1`     | `0`     | Runtime state              |
-| `restart_count`   | counter | no      | yes     | Restarts since creation    |
+| `restart_count`   | counter | yes     | yes     | Restarts since creation    |
 | `cpu_percent`     | gauge   | yes     | no      | CPU share since the previous cycle. 100 means one full core. The ceiling is the online core count times 100. |
 | `cpu_total_nanos` | counter | yes     | no      | Cumulative CPU nanoseconds since container start |
 | `mem_used_bytes`  | gauge   | yes     | no      | Memory in use, page cache removed |
@@ -295,8 +308,12 @@ Notes on the container source:
   the runtime reports no finish time.
 - The agent inspects at most 50 stopped containers per cycle, newest first. A
   host with a large graveyard of old containers stays cheap.
-- A running container has no `restart_count`. Watch `start_time` on
-  `obs_agent` and the container `cpu_total_nanos` reset for that signal.
+- The agent inspects a running container every 10 cycles to read its restart
+  count. The flag `-inspect-every` sets the number of cycles. Every cycle
+  reports the last known count, so the series holds one point per cycle and an
+  increase query over any window measures the restarts in that window.
+- A container in a restart loop never reaches the stopped list. The rising
+  `restart_count` of a running container is the signal for that state.
 - The one-shot endpoint returns an empty `precpu_stats` block. The agent keeps
   the previous CPU sample per container and does the delta math itself. The
   first cycle after start reports `cpu_percent=0`.
