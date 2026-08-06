@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  agent:
+    # Our own runner. GitHub's hosted runners are metered on a private repo and
+    # queue one job at a time; this repo is public, but one runner pool keeps
+    # both repos on the same, predictable path. The timeout makes a wedged job
+    # fail loudly instead of hanging.
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Check the toolchain
+        run: |
+          set -eu
+          for t in git go; do
+            command -v "$t" >/dev/null || { echo "this runner has no $t on PATH" >&2; exit 1; }
+          done
+      - name: Check out the commit
+        run: |
+          set -eu
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* 2>/dev/null || true
+          git init -q .
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch -q --depth 1 origin "${{ github.sha }}"
+          git checkout -q FETCH_HEAD
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - run: CGO_ENABLED=0 go build ./...
